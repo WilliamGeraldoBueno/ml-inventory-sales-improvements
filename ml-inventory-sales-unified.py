@@ -15,7 +15,7 @@ Opcional (se usar WMS/Sheets/Reposição):
   pip install gspread google-auth
 """
 
-import os, sys, json, time, csv, threading
+import os, sys, json, time, csv, threading, io
 from typing import Any, Dict, List, Optional, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -1203,7 +1203,7 @@ INDEX_HTML = """
         <button class="btn-secondary" onclick="syncInventory()">📦 Só Inventário</button>
         <button class="btn-warning" onclick="syncSales()">💰 Só Vendas</button>
         <button class="btn-success" onclick="exportCSV()">📊 Exportar CSV</button>
-        <button class="btn-secondary" onclick="importCSV()">📥 Importar CSV</button>
+        
         <button class="btn-secondary" onclick="mostrarPedidosTiny()">📦 Pedidos Tiny</button>
       </div>
     </div>
@@ -1475,6 +1475,45 @@ def background_sync_sales():
         set_progress(fase="vendas_concluido", ultimo_msg=f"Vendas: {result['full_orders_found']} pedidos FULL")
     except Exception as e:
         set_progress(fase="erro", ultimo_msg=f"Falhou: {type(e).__name__} — {str(e)[:180]}")
+
+
+# --------------------- Auto Import CSV ----------------------------
+def auto_import_csv():
+    """
+    Função para importar CSV automaticamente na inicialização
+    """
+    try:
+        if not CSV_IMPORT_AVAILABLE:
+            print("⚠️  CSV Importer não disponível")
+            return
+        
+        upload_dir = os.getenv("CSV_UPLOAD_DIR", os.path.join(OUT_DIR, "upload"))
+        if not os.path.exists(upload_dir):
+            print(f"📁 Diretório {upload_dir} não existe")
+            return
+        
+        csv_files = [f for f in os.listdir(upload_dir) if f.endswith('.csv') and ('ml_inventory_sales_unified' in f or 'inventory_sales_full' in f)]
+        if not csv_files:
+            print("📄 Nenhum arquivo CSV encontrado para importação automática")
+            return
+        
+        csv_files.sort(key=lambda x: os.path.getmtime(os.path.join(upload_dir, x)), reverse=True)
+        latest_csv = os.path.join(upload_dir, csv_files[0])
+        
+        print(f"📥 Importando automaticamente: {csv_files[0]}")
+        
+        db = get_db_session()
+        try:
+            importer = CSVImporter(db)
+            resultado = importer.importar_csv(latest_csv)
+            if resultado.get('status') == 'sucesso':
+                print(f"✅ CSV importado: {resultado['produtos_importados']} produtos, {resultado['produtos_com_necessidade']} com necessidade")
+            else:
+                print(f"❌ Erro na importação: {resultado.get('erro', 'Erro desconhecido')}")
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"❌ Erro na importação automática: {str(e)}")
 
 # ----------------------- Flask Routes ---------------------------
 @app.route("/")
