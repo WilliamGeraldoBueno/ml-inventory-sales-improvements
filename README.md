@@ -110,3 +110,4 @@ As melhorias foram implementadas seguindo as melhores práticas:
 **Data**: 15/09/2025  
 **Versão**: 1.0
 
+# Melhorias aplicadas via GitHub API
