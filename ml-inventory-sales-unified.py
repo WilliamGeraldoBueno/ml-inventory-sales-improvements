@@ -850,6 +850,150 @@ def collect_and_save_inventory() -> Dict[str, Any]:
     finally:
         db.close()
 
+
+
+@app.route("/api/pedidos-tiny-csv", methods=['GET'])
+def api_pedidos_tiny_csv():
+    """
+    Gera e retorna um arquivo CSV com as colunas:
+    - Inventory ID
+    - Pode Atender
+    
+    Filtra apenas itens com 'Pode Atender' >= 1
+    """
+    db = get_db_session()
+    try:
+        # Verifica se existe a tabela consolidada "items"
+        has_items = db.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='items'"
+        )).fetchone()
+
+        registros = []
+        if has_items:
+            # Usa necessidade_envio já consolidada
+            query = text("""
+                SELECT inventory_id, sku, title,
+                       COALESCE(necessidade_envio, 0) as necessidade_envio
+                FROM items
+                WHERE COALESCE(necessidade_envio, 0) > 0
+                ORDER BY necessidade_envio DESC
+            """)
+            result = db.execute(query)
+            for row in result:
+                registros.append({
+                    "inventory_id": row[0],
+                    "sku": row[1] or "",
+                    "title": row[2] or "",
+                    "necessidade_envio": int(row[3] or 0)
+                })
+        else:
+            # Fallback: calcula necessidade igual ao indicadores_reposicao_fallback
+            query = text("""
+                SELECT 
+                    ii.inventory_id,
+                    ii.sku,
+                    ii.title,
+                    COALESCE(CASE 
+                        WHEN ss.units_30d > COALESCE(ist.available_quantity,0) 
+                        THEN ss.units_30d - COALESCE(ist.available_quantity,0)
+                        ELSE 0 END, 0) as necessidade_envio
+                FROM inventory_items ii
+                LEFT JOIN inventory_stock ist ON ii.inventory_id = ist.inventory_id
+                LEFT JOIN sales_summary ss    ON ii.item_id = ss.item_id
+                     AND (ii.variation_id = ss.variation_id OR (ii.variation_id IS NULL AND ss.variation_id IS NULL))
+                WHERE ii.is_full = 1
+                ORDER BY necessidade_envio DESC
+            """)
+            result = db.execute(query)
+            for row in result:
+                if (row[3] or 0) > 0:
+                    registros.append({
+                        "inventory_id": row[0], "sku": row[1] or "",
+                        "title": row[2] or "", "necessidade_envio": int(row[3] or 0)
+                    })
+
+        # Se não houver necessidade, retorna CSV vazio
+        if not registros:
+            output = io.StringIO()
+            writer = csv.writer(output, delimiter=';')
+            writer.writerow(['Inventory ID', 'Pode Atender'])
+            writer.writerow(['', 'Nenhum item com necessidade de envio'])
+            
+            csv_content = output.getvalue()
+            output.close()
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"pedidos_tiny_{timestamp}.csv"
+            
+            return Response(
+                csv_content,
+                mimetype='text/csv',
+                headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+            )
+
+        # Consulta WMS (se disponível) para calcular 'pode_atender'
+        wms_client = WMSSmartGO(WMS_API_KEY) if WMS_AVAILABLE and WMS_API_KEY else None
+        saida = []
+        
+        for r in registros:
+            necessidade = int(r["necessidade_envio"] or 0)
+            estoque_wms = 0
+            
+            if necessidade > 0 and wms_client:
+                try:
+                    codigo = r["sku"] or r["inventory_id"]
+                    resp = wms_client.consultar_por_codigo_universal(codigo)
+                    if isinstance(resp, list) and resp:
+                        estoque_wms = (resp[0].get('quantidadeDisponivel', 0)
+                                       or resp[0].get('quantidade_disponivel', 0) or 0)
+                    elif isinstance(resp, dict):
+                        estoque_wms = (resp.get('quantidadeDisponivel', 0)
+                                       or resp.get('quantidade_disponivel', 0) or 0)
+                except Exception:
+                    estoque_wms = 0
+            
+            pode_atender = min(necessidade, int(estoque_wms or 0))
+            
+            # FILTRO: Apenas itens com 'Pode Atender' >= 1
+            if pode_atender >= 1:
+                saida.append({
+                    "inventory_id": r["inventory_id"],
+                    "pode_atender": int(pode_atender)
+                })
+
+        # Gerar CSV
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=';')
+        
+        # Cabeçalho
+        writer.writerow(['Inventory ID', 'Pode Atender'])
+        
+        # Verificar se há dados para incluir
+        if not saida:
+            writer.writerow(['', 'Nenhum item com "Pode Atender" >= 1'])
+        else:
+            # Dados ordenados por quantidade decrescente
+            saida.sort(key=lambda x: x["pode_atender"], reverse=True)
+            for item in saida:
+                writer.writerow([item["inventory_id"], item["pode_atender"]])
+        
+        csv_content = output.getvalue()
+        output.close()
+        
+        # Nome do arquivo com timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"pedidos_tiny_{timestamp}.csv"
+        
+        return Response(
+            csv_content,
+            mimetype='text/csv',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+        )
+        
+    except Exception as e:
+        return jsonify({"status":"erro","erro":str(e)}), 500
+    finally:
+        db.close()
 def collect_and_save_sales() -> Dict[str, Any]:
     db = get_db_session()
     try:
@@ -1408,20 +1552,26 @@ async function importCSV(){
   } catch(e) { document.getElementById('status').textContent = 'Erro ao importar CSV'; }
 }
 async function mostrarPedidosTiny(){
+  document.getElementById('status').textContent = 'Gerando arquivo Pedidos Tiny...';
   try {
-    document.getElementById('status').textContent = 'Gerando Pedidos Tiny...';
-    const resp = await fetch('/api/pedidos-tiny');
-    const data = await resp.json();
-    const card = document.getElementById('tinyCard');
-    const tb = document.getElementById('tinyTbody');
-    tb.innerHTML = '';
-    if (data.status === 'sucesso' && (data.itens || []).length){
-      for (const it of data.itens){
-        const tr = document.createElement('tr');
-        const tdInv = document.createElement('td'); tdInv.textContent = it.inventory_id;
-        const tdQtt = document.createElement('td'); tdQtt.innerHTML = `<span class="qty">${it.quantidade_enviar}</span>`;
-        tr.appendChild(tdInv); tr.appendChild(tdQtt); tb.appendChild(tr);
-      }
+    const r = await fetch('/api/pedidos-tiny-csv', {method:'GET'});
+    if(r.ok) {
+      const blob = await r.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = r.headers.get('Content-Disposition')?.split('filename=')[1]?.replace(/"/g, '') || 'pedidos_tiny.csv';
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.getElementById('status').textContent = 'Arquivo Pedidos Tiny baixado com sucesso!';
+    } else {
+      const data = await r.json();
+      document.getElementById('status').textContent = data.erro || 'Erro ao gerar arquivo Pedidos Tiny';
+    }
+  } catch(e) {
+    document.getElementById('status').textContent = 'Erro ao gerar arquivo Pedidos Tiny';
+  }
+}
       card.style.display = 'block';
       document.getElementById('status').textContent = `Pedidos Tiny: ${data.total} itens`;
     } else {
